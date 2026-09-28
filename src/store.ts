@@ -1,6 +1,22 @@
 import { defineStore } from 'pinia';
+import {
+  resolveAllThemes,
+  parseReference,
+  isColorValue,
+  THEME_KEYS,
+  THEME_LABELS,
+  type TokenCategory,
+  type ResolveIssue,
+  type ResolveResult
+} from './tokens/resolver';
+import {
+  buildReleaseSnapshot,
+  buildResolvedDiff,
+  issueTypeLabel,
+  type ReleaseSnapshot
+} from './tokens/snapshot';
 
-export type TokenCategory = 'color' | 'font' | 'spacing' | 'radius' | 'shadow' | 'component';
+export type { TokenCategory } from './tokens/resolver';
 export type Token = {
   id: string;
   name: string;
@@ -47,9 +63,17 @@ const changes: ChangeRequest[] = [
   { id: 'CR-423', title: '统一浮层圆角', requester: '组件维护组', scope: '12 个组件 · 36 处引用', impact: 28, status: '待评审', diff: { token: 'radius.control', before: '8px', after: '6px' } }
 ];
 
+/** 发布基线：冻结初始令牌（含各变体原始值），用于差异与快照对比 */
+const baseline: Token[] = initialTokens.map((token) => ({
+  ...token,
+  themes: { ...token.themes }
+}));
+
 const storageKey = 'yy63-token-governance';
 const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(storageKey) : null;
 const saved = raw ? JSON.parse(raw) : null;
+
+export type IssueView = { issue: ResolveIssue; tokenId: string; theme: string; themeLabel: string };
 
 export const useTokenStore = defineStore('tokens', {
   state: () => ({
@@ -62,9 +86,13 @@ export const useTokenStore = defineStore('tokens', {
     releaseVersion: '4.6.0-rc.2',
     locked: (saved?.locked as boolean) ?? false,
     lastPublished: (saved?.lastPublished as string) ?? 'DS 4.5.2',
-    baseline: initialTokens.map((token) => ({ id: token.id, value: token.value }))
+    baseline,
+    /** 最近一次发布锁定时生成的只读快照 */
+    releaseSnapshot: (saved?.releaseSnapshot as ReleaseSnapshot | null) ?? null
   }),
   getters: {
+    themes: () => THEME_KEYS,
+    themeLabels: () => THEME_LABELS,
     selectedToken(state): Token | undefined {
       return state.tokens.find((token) => token.id === state.selectedTokenId);
     },
@@ -76,48 +104,98 @@ export const useTokenStore = defineStore('tokens', {
         return matchesSearch && matchesCategory;
       });
     },
-    dependencyEdges(state) {
-      return state.tokens.filter((token) => token.ref).map((token) => ({ from: token.ref!, to: token.id }));
+    /** 全部令牌 × 全部变体的引用解析结果（基础令牌一改，这里整体重算） */
+    resolvedMap(state): Record<string, Record<string, ResolveResult>> {
+      return resolveAllThemes(state.tokens, THEME_KEYS);
     },
-    cycleNodes(state): string[] {
-      const graph = new Map<string, string>();
-      state.tokens.filter((token) => token.ref).forEach((token) => graph.set(token.id, token.ref!));
-      const cycle = new Set<string>();
-      graph.forEach((_, start) => {
-        const path: string[] = [];
-        let current: string | undefined = start;
-        while (current && !path.includes(current)) {
-          path.push(current);
-          current = graph.get(current);
+    activeResolved(): Record<string, ResolveResult> {
+      return this.resolvedMap[this.activeTheme] ?? {};
+    },
+    /** 跨全部变体汇总的失效引用 */
+    allIssues(): IssueView[] {
+      const views: IssueView[] = [];
+      THEME_KEYS.forEach((theme) => {
+        const results = this.resolvedMap[theme];
+        Object.entries(results).forEach(([tokenId, result]) => {
+          if (result.issue) views.push({ issue: result.issue, tokenId, theme, themeLabel: THEME_LABELS[theme] ?? theme });
+        });
+      });
+      return views;
+    },
+    cycleIssues(): IssueView[] {
+      return this.allIssues.filter((view) => view.issue.type === 'cycle');
+    },
+    brokenIssues(): IssueView[] {
+      return this.allIssues.filter((view) => view.issue.type === 'broken');
+    },
+    typeMismatchIssues(): IssueView[] {
+      return this.allIssues.filter((view) => view.issue.type === 'type-mismatch');
+    },
+    /** 成环令牌（任意变体命中即算），供依赖图标红 */
+    cycleNodes(): string[] {
+      return [...new Set(this.cycleIssues.map((view) => view.tokenId))];
+    },
+    /** 当前变体下，顺着主题原始值得到的引用边（from 被引用令牌 → to 别名） */
+    activeEdges(state): { from: string; to: string }[] {
+      const edges: { from: string; to: string }[] = [];
+      state.tokens.forEach((token) => {
+        const raw = this.activeTheme in token.themes ? token.themes[this.activeTheme] : token.value;
+        const refId = parseReference(raw);
+        if (refId) edges.push({ from: refId, to: token.id });
+      });
+      return edges;
+    },
+    /** 兼容旧展示：失效引用所在令牌 */
+    invalidReferences(): Token[] {
+      const ids = new Set(this.allIssues.map((view) => view.tokenId));
+      return this.tokens.filter((token) => ids.has(token.id));
+    },
+    /** 携带具体令牌与变体的失效清单，供发布前逐条列出 */
+    issueList(): { key: string; type: string; typeLabel: string; theme: string; themeLabel: string; tokenId: string; tokenName: string; message: string; path: string[] }[] {
+      return this.allIssues.map((view) => {
+        const token = this.tokens.find((item) => item.id === view.tokenId);
+        return {
+          key: `${view.theme}:${view.tokenId}:${view.issue.type}`,
+          type: view.issue.type,
+          typeLabel: issueTypeLabel(view.issue.type),
+          theme: view.theme,
+          themeLabel: THEME_LABELS[view.theme] ?? view.theme,
+          tokenId: view.tokenId,
+          tokenName: token?.name ?? view.tokenId,
+          message: view.issue.message,
+          path: view.issue.path
+        };
+      });
+    },
+    /** 跨全部变体的对比度检查（发布门禁不能只看当前页面） */
+    contrastIssues(): { title: string; detail: string }[] {
+      const out: { title: string; detail: string }[] = [];
+      THEME_KEYS.forEach((theme) => {
+        const text = this.resolvedMap[theme]?.['color.text.primary'];
+        const surface = this.resolvedMap[theme]?.['color.surface.canvas'];
+        const themeLabel = THEME_LABELS[theme] ?? theme;
+        if (!text?.ok || !isColorValue(text.value)) {
+          out.push({ title: `${themeLabel}正文色无法解析`, detail: `color.text.primary 引用链未落到有效颜色（${text?.issue ? issueTypeLabel(text.issue.type) : '缺令牌'}），无法计算对比度。` });
+          return;
         }
-        if (current && path.includes(current)) path.slice(path.indexOf(current)).forEach((id) => cycle.add(id));
+        if (!surface?.ok || !isColorValue(surface.value)) {
+          out.push({ title: `${themeLabel}背景色无法解析`, detail: `color.surface.canvas 引用链未落到有效颜色（${surface?.issue ? issueTypeLabel(surface.issue.type) : '缺令牌'}），无法计算对比度。` });
+          return;
+        }
+        const ratio = contrastRatio(text.value!, surface.value!);
+        if (ratio < 4.5) {
+          out.push({ title: `${themeLabel}正文与页面背景对比度不足`, detail: `当前 ${ratio.toFixed(2)}:1，要求至少 4.5:1。` });
+        }
       });
-      return [...cycle];
+      return out;
     },
-    invalidReferences(state) {
-      const ids = new Set(state.tokens.map((token) => token.id));
-      return state.tokens.filter((token) => token.ref && !ids.has(token.ref));
-    },
-    contrastIssues(state) {
-      const text = state.tokens.find((token) => token.id === 'color.text.primary');
-      const surface = state.tokens.find((token) => token.id === 'color.surface.canvas');
-      const values = [text?.themes[state.activeTheme], surface?.themes[state.activeTheme]].filter(Boolean) as string[];
-      if (values.length < 2) return [];
-      const ratio = contrastRatio(values[0], values[1]);
-      return ratio < 4.5 ? [{ title: '正文与页面背景对比度不足', detail: `当前 ${ratio.toFixed(2)}:1，要求至少 4.5:1。` }] : [];
-    },
+    /** 跨变体差异：对比每个变体解析后的最终值（含失效状态） */
     diffRows(state) {
-      return state.tokens.filter((token) => {
-        const base = state.baseline.find((item) => item.id === token.id);
-        return !base || base.value !== token.value;
-      }).map((token) => {
-        const base = state.baseline.find((item) => item.id === token.id);
-        return { id: token.id, before: base?.value ?? '新增', after: token.value, name: token.name };
-      });
+      return buildResolvedDiff(state.tokens, state.baseline, THEME_KEYS);
     },
-    releaseReadiness(state): number {
-      const base = 100 - this.cycleNodes.length * 25 - this.invalidReferences.length * 20 - this.contrastIssues.length * 15;
-      return Math.max(0, base);
+    releaseReadiness(): number {
+      const penalty = this.allIssues.length * 8 + this.contrastIssues.length * 12;
+      return Math.max(0, 100 - penalty);
     }
   },
   actions: {
@@ -160,19 +238,24 @@ export const useTokenStore = defineStore('tokens', {
     rollback() {
       this.baseline.forEach((base) => {
         const token = this.tokens.find((item) => item.id === base.id);
-        if (token) token.value = base.value;
+        if (token) {
+          token.value = base.value;
+          token.themes = { ...base.themes };
+          token.ref = base.ref;
+        }
       });
       this.persist();
     },
     lockRelease() {
-      if (this.cycleNodes.length === 0 && this.invalidReferences.length === 0 && this.contrastIssues.length === 0 && this.changes.every((item) => item.status !== '待评审')) {
+      if (this.allIssues.length === 0 && this.contrastIssues.length === 0 && this.changes.every((item) => item.status !== '待评审')) {
         this.locked = true;
         this.lastPublished = `DS ${this.releaseVersion}`;
+        this.releaseSnapshot = buildReleaseSnapshot(this.tokens, this.releaseVersion, this.baseline, THEME_KEYS);
       }
       this.persist();
     },
     persist() {
-      if (typeof localStorage !== 'undefined') localStorage.setItem(storageKey, JSON.stringify({ tokens: this.tokens, changes: this.changes, activeTheme: this.activeTheme, selectedTokenId: this.selectedTokenId, search: this.search, category: this.category, locked: this.locked, lastPublished: this.lastPublished }));
+      if (typeof localStorage !== 'undefined') localStorage.setItem(storageKey, JSON.stringify({ tokens: this.tokens, changes: this.changes, activeTheme: this.activeTheme, selectedTokenId: this.selectedTokenId, search: this.search, category: this.category, locked: this.locked, lastPublished: this.lastPublished, releaseSnapshot: this.releaseSnapshot }));
     }
   }
 });
